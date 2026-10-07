@@ -23,11 +23,19 @@ create figure below is an upper bound rather than the shape. MAX_NOTES_TOTAL is 
 and 480 ms at 163840 when re-measured on tmpfs, and is ~0.1 ms now, so the line below is
 the cost that change removed rather than a cost anyone still pays:
 
-  store, per NEW room/note (the create path, serialised behind the create gate):
+  store, per NEW room/note (the create path):
     _check_room_capacity                 ~16 ms   count + byte budget, one scandir pass.
-                                                  Still O(rooms), deliberately: the byte
-                                                  total has to be exact, and the scan that
-                                                  gets it returns the count anyway
+                                                  O(rooms) when this was measured; #578 moved
+                                                  both figures onto .usage, which the reaper
+                                                  rewrites from a walk it already makes, so
+                                                  this is ~0 ms now and reads no directories
+                                                  at all (tests/unit/test_room_count.py pins
+                                                  the zero). The line below is the cost that
+                                                  change removed. #578 also retired the
+                                                  service-wide create gate this whole section
+                                                  used to be serialised behind: what a create
+                                                  now holds against other creates is a
+                                                  counter read-modify-write, not a room write
     _check_note_capacity                  ~0 ms   was ~25 ms. The global cap reads
                                                   .notes-count instead of walking every
                                                   namespace; only the per-namespace cap
@@ -200,13 +208,13 @@ def store_bench(root: Path) -> None:
 
     def room_gate() -> None:
         try:
-            store._check_room_capacity(fresh_room)
+            store._check_room_capacity(root, fresh_room)
         except store.StoreError:
             pass  # at the cap the refusal is the answer; the walk is what we are timing
 
     def note_gate() -> None:
         try:
-            store._check_note_capacity(root, fresh_note)
+            store._check_note_capacity(root, root / "notes" / "ns0", fresh_note)
         except store.StoreError:
             pass
 
@@ -224,7 +232,7 @@ def store_bench(root: Path) -> None:
     bench("glob  rooms/*.jsonl", lambda: _drain(root.glob("rooms/*.jsonl")))
     bench("_walk rooms .jsonl", lambda: _drain(store._walk(root / "rooms", ".jsonl")))
     bench("glob  notes/*/*.txt", lambda: _drain(root.glob("notes/*/*.txt")))
-    bench("_walk notes .txt", lambda: _drain(store._walk(root / "notes", ".txt", True)))
+    bench("_walk notes .txt", lambda: _drain(store._walk(root / "notes", ".txt")))
     bench("_scan notes .txt (count only)", lambda: _scan_notes(root))
 
 
@@ -319,26 +327,34 @@ def rooms_cache_bench(root: Path, seconds: float = 6.0) -> None:
     is counted at the call, not inferred from a latency, so the figure is exact.
 
     It drives `app._rooms_view` rather than the route, so it measures the stamp alone. The
-    `_rooms_cache.clear()` that used to run on every write in `take` cost the same thing
+    `_rooms_walk` clear that used to run on every write in `take` cost the same thing
     per worker, and is gone for the same reason; a server-level run (`--port`) is what shows
     the two together.
     """
     import app
     import config
 
-    messages_per_sec, rooms_per_sec = 24.0, 2.85  # technocore.chat, 0.9.3, under live load
+    # technocore.chat under live load. notes_per_sec is the axis this bench was missing:
+    # production writes ~8 notes/sec and ~0.05 of them are topics, so a stamp that keys on
+    # notes_written turns over ~24x per 3s window even with `messages` already out of it.
+    messages_per_sec, rooms_per_sec, notes_per_sec = 24.0, 2.85, 8.0
     pool = min(512, _drain((root / "rooms").glob("r*.jsonl"))) or 1
 
     def run(label: str, keys: tuple) -> None:
-        walks, latencies, sent, served = 0, [], 0, 0
+        walks, latencies, sent, served, noted = 0, [], 0, 0, 0
         last: dict | None = None
-        app._rooms_cache.clear()
+        app._rooms_walk.cache_clear()
         app.ROOMS_STAMP_KEYS = keys
         start = time.monotonic()
         while (now := time.monotonic() - start) < seconds:
             if sent / messages_per_sec <= now:
                 store.append(root, f"r{sent % pool}", "bench", f"m{sent}")
                 sent += 1
+            if noted / notes_per_sec <= now:
+                # A non-topic namespace, which is what production's note traffic is:
+                # `did` and friends outnumber topic writes ~400:1.
+                store.note_set(root, "did", f"k{noted % 4096:04x}", f"v{noted}")
+                noted += 1
             if served / rooms_per_sec <= now:
                 at = time.perf_counter()
                 view = app._rooms_view(50)
@@ -372,8 +388,10 @@ def rooms_cache_bench(root: Path, seconds: float = 6.0) -> None:
         # config.ROOT is bound at import, and this script imports store (hence config) long
         # before it knows where the store is. Without this both halves walk /data.
         with config.override(ROOT=root):
-            run("messages in the stamp", ("messages", *stamped))
-            run("structural stamp only", stamped)
+            structural = ("rooms_created", "reaped_idle", "reaped_stillborn")
+            run("0.9.3: messages + notes", ("messages", *structural, "notes_written"))
+            run("0.9.4: notes_written", (*structural, "notes_written"))
+            run("proposed: topics_written", (*structural, "topics_written"))
     finally:
         app.ROOMS_STAMP_KEYS = stamped
     print(

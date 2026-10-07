@@ -3,6 +3,7 @@
 import _client
 import pytest
 from _client import (
+    _claim,
     _keypair,
     _post_signed,
     _say_signed,
@@ -51,6 +52,34 @@ def test_a_lost_conditional_write_carries_the_value_after_the_first_line(client)
     lines = lost.text.rstrip("\n").split("\n")
     assert lines[0].startswith("409") and "world" not in lines[0]
     assert lines[-1] == "world"
+
+
+def test_409_marks_the_stranger_value_untrusted_without_moving_it(client):
+    """#291: the 409 body handed another caller's note value straight to the reader with
+    no warning at all, directly beneath a server-authored imperative ("merge your change
+    into the value below") — exactly what design.md §3.1's "refuse to be an authority"
+    principle rules out. The read lane marks the same kind of content with BANNER, but
+    gluing BANNER's own line above the value here would move it off the anchor CAS callers
+    already depend on: the announced length, and being the body's last line (pinned by
+    test_a_lost_conditional_write_carries_the_value_after_the_first_line above). So the
+    fix folds the warning into the instruction sentence instead of prepending a line, and
+    this test pins both halves: the warning exists, and the value's position does not move.
+    """
+    client.get("/kv/plans/next/set/world")
+    lost = client.get("/kv/plans/next/set/nope?if=stale")
+    assert lost.status_code == 409
+    lines = lost.text.rstrip("\n").split("\n")
+
+    # Unmoved: still the exact last line, still preceded by the length announcement and
+    # nothing else — a caller counting past that line lands on the value, same as before.
+    assert lines[-1] == "world"
+    assert lines[-2].startswith("current value follows (")
+
+    # Marked: the instruction ahead of the value now says it is untrusted, and that
+    # sentence does not itself leak the value it is warning about.
+    instruction = "\n".join(lines[:-2])
+    assert "untrusted" in instruction.lower()
+    assert "world" not in instruction
 
 
 def test_webmcp_tool_results_carry_the_whole_server_reply(client):
@@ -224,6 +253,43 @@ def test_a_replayed_signed_url_is_refused_while_the_message_is_still_there(clien
     assert client.get("/r/lobby?format=json").json()["count"] == 2
 
 
+def test_a_replay_is_accepted_once_traffic_buries_the_record_past_the_scan_tail(client, tmp_path):
+    """The far side of test_a_replayed_signed_url_is_refused_while_the_message_is_still_there.
+
+    `_last_nonce` scans the newest READ_BUDGET bytes of tail for the DID, and its
+    docstring is explicit that the bound is the retention model working as designed:
+    once newer traffic buries the record past that tail, the same signed URL is
+    accepted again, even while the record remains in the room ring. That boundary was
+    stated in prose only - pin it, so a change that moves it (record-size growth such
+    as the `sig` field, a budget change) fails here instead of shipping silently.
+    """
+    import orjson
+
+    import store
+
+    did, sign = _keypair()
+    url = f"/r/lobby/say-signed/{did}/{sign('lobby|7|once')}/7/once"
+    assert client.get(url).status_code == 200
+    path = store.room_path(tmp_path, "lobby")
+    original = path.read_bytes()
+    seq = 2
+    with path.open("ab") as f:
+        written = 0
+        while written < store.READ_BUDGET + 65536:
+            line = (
+                orjson.dumps({"seq": seq, "ts": store._now(), "from": "~bury", "text": "x" * 200})
+                + b"\n"
+            )
+            f.write(line)
+            written += len(line)
+            seq += 1
+    assert path.stat().st_size > store.READ_BUDGET
+    r = client.get(url)
+    assert r.status_code == 200
+    # buried past the scan tail, not reaped: the original record is still in the ring
+    assert path.read_bytes().startswith(original)
+
+
 def test_a_did_quoted_in_another_agents_text_is_not_that_agents_nonce(client):
     """`_last_nonce` rejects lines on bytes before parsing them, and a DID may legally
     appear in a *message* — an agent addressing another by name. Only `from` is that
@@ -247,6 +313,44 @@ def test_a_did_quoted_in_another_agents_text_is_not_that_agents_nonce(client):
     replay = _post_signed(client, "lobby", quoted, quoted_sign, "on my way", nonce=5)
     assert replay.status_code == 400 and "not greater than 5" in replay.text
     assert _post_signed(client, "lobby", quoted, quoted_sign, "again", nonce=6).status_code == 200
+
+
+def test_head_never_executes_a_get_write_lane(client):
+    """Starlette gives HEAD to GET routes automatically; on a write-shaped GET that
+    would make link checkers mutate state while discarding the only useful response.
+
+    The signed case is the security edge: a HEAD probe must not spend a bearer URL's
+    nonce before the agent that created the signature can submit it.
+    """
+    assert client.head("/r/head-room/say/bot/hello").status_code == 405
+    assert client.get("/r/head-room?format=json").json()["count"] == 0
+
+    assert client.head("/kv/head/key/set/value").status_code == 405
+    assert client.get("/kv/head/key").status_code == 404
+
+    did, sign = _keypair()
+    signed = f"/r/head-signed/say-signed/{did}/{sign('head-signed|1|once')}/1/once"
+    refused = client.head(signed)
+    assert refused.status_code == 405 and refused.headers["allow"] == "GET"
+    # Nothing was appended, so nothing raised the floor a message replay is judged against:
+    # that nonce is read back off the room's own records, not from a separate counter.
+    assert client.get("/r/head-signed?format=json").json()["count"] == 0
+    assert client.get(signed).status_code == 200  # so nonce 1 is still unspent
+
+    # The ownership lane burns a *server-written* counter shared by every signer, so a
+    # half-spent one would be visible to third parties and would strand the real writer's
+    # captured URL. The gate must refuse before the counter moves, not after.
+    owner, owner_sign = _keypair(seed=3)
+    room = "d-head-owned"
+    assert _claim(client, room, owner, owner_sign).status_code == 200  # burns nonce 1
+    allow = f"/kv/room-allow/{room}/set-signed/{owner}/{owner_sign(f'room-allow|{room}|2|{owner}')}/2/{owner}"
+    probe = client.head(allow)
+    assert probe.status_code == 405 and probe.headers["allow"] == "GET"
+    assert client.get(f"/kv/room-nonce/{room}").text.strip().endswith("1")  # not 2
+    assert client.get(allow).status_code == 200  # the captured URL still spends
+    assert client.get(f"/kv/room-nonce/{room}").text.strip().endswith("2")
+
+    assert client.head("/r/head-signed").status_code == 200  # read-shaped GET keeps HEAD
 
 
 def test_the_signature_covers_the_swept_text_not_the_raw_text(client):
@@ -357,3 +461,37 @@ def test_signed_writes_pay_the_write_budget_like_any_other(client, monkeypatch):
             _say_signed(client, "lobby", did, sign, f"m{i}", nonce=i).status_code for i in (1, 2, 3)
         ]
         assert codes == [200, 200, 429]
+
+
+def test_note_reads_are_edge_cacheable_like_room_reads(client):
+    """The CDN's cache rule has always covered /kv/, but the handlers never marked a note
+    read shareable, so every one went to the origin — the rule matched a reply that never
+    said it could be held. A note's bytes are the same for every caller that can name it.
+
+    An unlisted `p-` key is a capability URL, so a copy keyed on that URL reaches exactly
+    the callers who could already read it, which is why it is cacheable on the same terms
+    rather than excluded.
+    """
+    client.get("/kv/e-tc-cache/k/set/value")
+    for path in ("/kv/e-tc-cache/k", "/kv/e-tc-cache"):
+        cc = client.get(path).headers["cache-control"]
+        assert "s-maxage=" in cc and "max-age=0" in cc, f"{path} is not shareable: {cc}"
+
+    # A p- key is unlisted, not unshareable: same header, and the URL is the credential.
+    client.get("/kv/p-tc-cache/k/set/secret")
+    assert "s-maxage=" in client.get("/kv/p-tc-cache/k").headers["cache-control"]
+
+
+def test_a_note_read_carrying_a_budget_footer_is_not_shared(client):
+    """The footer is one caller's pacing, so the reply stops being the CDN's to hand out.
+    This is the half that keeps the line above from leaking one caller's numbers to another.
+    """
+    import config
+
+    client.get("/kv/e-tc-cache/k/set/value")
+    with config.override(RATE_READ=8):
+        for _ in range(7):
+            client.get("/kv/e-tc-cache/k")
+        warned = client.get("/kv/e-tc-cache/k")
+        assert "# budget:" in warned.text
+        assert warned.headers["cache-control"] == "no-store"
